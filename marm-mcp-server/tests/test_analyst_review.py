@@ -1,6 +1,8 @@
 import asyncio
 import json
+import sqlite3
 import sys
+import types
 
 import pytest
 
@@ -1014,16 +1016,26 @@ def test_the_switch_is_saved_and_reported_over_http(monkeypatch, tmp_path):
 # --- credentials without a label ------------------------------------------------
 
 
+# Built from parts so the file itself carries no scannable secret.
+_JWT = (
+    "eyJhbGciOiJIUzI1NiJ9"
+    + "."
+    + "eyJzdWIiOiIxMjM0NTY3ODkwIn0"
+    + "."
+    + "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+)
+
+
 @pytest.mark.parametrize(
     "secret",
     [
-        "sk-proj-4f9aZbQ2x7LmN1cV8tR3wY6uP0sK5dE2",
-        "ghp_16C7e42F292c6912E7710c838347Ae178B4a",
-        "AKIAIOSFODNN7EXAMPLE",
-        "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
-        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
-        "postgres://admin:hunter2secret@db.internal:5432/app",
-        "xoxb-2748-39201-Fk2d9QmZpL0aXv7T",
+        "sk-" + "proj-" + "4f9aZbQ2x7LmN1cV" + "8tR3wY6uP0sK5dE2",
+        "ghp_" + "16C7e42F292c6912" + "E7710c838347Ae178B4a",
+        "AKIA" + "IOSFODNN7" + "EXAMPLE",
+        "Bearer " + _JWT,
+        _JWT,
+        "postgres://" + "admin:" + "hunter2secret" + "@db.internal:5432/app",
+        "xox" + "b-2748-39201-" + "Fk2d9QmZpL0aXv7T",
     ],
 )
 def test_a_raw_credential_blocks_automatic_apply(monkeypatch, secret):
@@ -1105,3 +1117,85 @@ def test_an_applied_proposal_is_not_left_awaiting_review(staged_memory, monkeypa
     assert applied["applied_memory_id"]
     assert out["applied"] == 1
     assert out["staged"] == 0, "staged counts only what awaits review"
+
+
+def test_the_source_is_split_once_per_run_not_once_per_proposal(
+    staged_memory, monkeypatch
+):
+    from marm_mcp_server.services import distill
+
+    monkeypatch.setenv(review.AUTO_APPLY_ENV, "1")
+    text = (
+        "We decided that apply claims the row before writing it. "
+        "We decided that compaction never deletes the source memories. "
+        "We decided that recall always returns the newest memory first."
+    )
+    out = asyncio.run(
+        distill.propose(
+            staged_memory, text, session_name="s", use_llm=False, review_mode="manual"
+        )
+    )
+    pids = [p["id"] for p in out["proposals"] if p.get("staged")]
+    assert len(pids) >= 2
+
+    calls = []
+    real = review._source_sentences
+    monkeypatch.setattr(
+        review, "_source_sentences", lambda t: calls.append(t) or real(t)
+    )
+    asyncio.run(review.auto_apply(staged_memory, pids, source_text=text))
+    assert len(calls) == 1
+
+
+def test_one_failing_proposal_does_not_hide_the_others(staged_memory, monkeypatch):
+    from marm_mcp_server.services import distill
+
+    monkeypatch.setenv(review.AUTO_APPLY_ENV, "1")
+    text = (
+        "We decided that apply claims the row before writing it. "
+        "We decided that compaction never deletes the source memories."
+    )
+    out = asyncio.run(
+        distill.propose(
+            staged_memory, text, session_name="s", use_llm=False, review_mode="manual"
+        )
+    )
+    first, second = [p["id"] for p in out["proposals"] if p.get("staged")][:2]
+    real = review.resolve
+    seen = []
+
+    async def flaky(memory, candidates, **kw):
+        seen.append(candidates[0].content)
+        if len(seen) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return await real(memory, candidates, **kw)
+
+    monkeypatch.setattr(review, "resolve", flaky)
+    decisions = asyncio.run(
+        review.auto_apply(staged_memory, [first, second], source_text=text)
+    )
+
+    assert [d["proposal_id"] for d in decisions] == [first, second]
+    assert decisions[0]["applied"] is False and "error" in decisions[0]
+    assert decisions[1]["applied"] is True
+
+
+def test_a_guardrails_failure_still_reports_what_was_staged(monkeypatch):
+    from marm_mcp_server.services import code_context
+
+    async def staged(*_a, **_k):
+        return {"staged": ["p-1", "p-2"], "skipped": []}
+
+    async def broken(*_a, **_k):
+        raise RuntimeError("store unavailable")
+
+    monkeypatch.setattr(review, "stage_conclusions", staged)
+    monkeypatch.setattr(review, "auto_apply", broken)
+    monkeypatch.setattr(code_context, "_memory_scope", lambda ctx: "demo")
+    ctx = types.SimpleNamespace(project={"name": "demo"})
+
+    result = asyncio.run(code_context._review_brief(object(), "how", ctx, "guardrails"))
+
+    assert result["staged"] == ["p-1", "p-2"]
+    assert result["decisions"] == []
+    assert any("guardrails" in s["reason"] for s in result["skipped"])
